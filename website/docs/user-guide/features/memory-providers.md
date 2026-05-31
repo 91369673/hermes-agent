@@ -136,6 +136,50 @@ The legacy `hermes honcho setup` command still works (it now redirects to `herme
 
 </details>
 
+<details>
+<summary>Self-hosted semantic search with local embeddings</summary>
+
+Self-hosted Honcho deployments need an embedding endpoint for semantic search over messages and memories. The Honcho reasoning model and the embedding model are separate: use a small embedding model for vectors, not a flagship chat model.
+
+A validated low-resource pattern is to run a local OpenAI-compatible embedding service with FastEmbed and point Honcho at it from Docker:
+
+```text
+Host endpoint:   http://127.0.0.1:18080/v1/embeddings
+Docker endpoint: http://host.docker.internal:18080/v1
+Model:           sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2
+Native dims:     384
+Served dims:     1536, zero-padded for existing Honcho pgvector schemas
+```
+
+Honcho `.env` settings:
+
+```text
+EMBED_MESSAGES=true
+EMBEDDING_MODEL_CONFIG__TRANSPORT=openai
+EMBEDDING_MODEL_CONFIG__MODEL=sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2
+EMBEDDING_MODEL_CONFIG__OVERRIDES__BASE_URL=http://host.docker.internal:18080/v1
+EMBEDDING_MODEL_CONFIG__OVERRIDES__API_KEY=dummy-local-embeddings
+EMBEDDING_MODEL_CONFIG__DIMENSIONS_MODE=always
+EMBEDDING_VECTOR_DIMENSIONS=1536
+EMBEDDING_MAX_INPUT_TOKENS=512
+```
+
+Operational checks:
+
+```bash
+curl -sS http://127.0.0.1:18080/health
+curl -sS http://127.0.0.1:8000/health
+docker logs --since 5m honcho-api-1 2>&1 \
+  | grep -Ei 'invalid_api_key|AuthenticationError|search_memory failed|search_messages failed|Traceback|embedding.*failed|HTTP/1\.1" 401' \
+  || true
+```
+
+Expected state: embedding health returns `ok: true` with target dimension `1536`, Honcho health returns `{"status":"ok"}`, semantic search returns relevant results, and recent logs have no embedding/authentication errors.
+
+For a full Mac LaunchAgent recipe, Docker reachability test, internal `EmbeddingClient` probe, smoke test, and pitfalls, see the `honcho-local-embeddings` skill shipped under `skills/autonomous-ai-agents/honcho-local-embeddings/`.
+
+</details>
+
 :::tip Migrating from `hermes honcho`
 If you previously used `hermes honcho setup`, your config and all server-side data are intact. Just re-enable through the setup wizard again or manually set `memory.provider: honcho` to reactivate via the new system.
 :::
