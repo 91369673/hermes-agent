@@ -52,7 +52,10 @@ Two independent layers, each on its own cadence:
 **Layer 2 — Dialectic supplement** (fired every `dialecticCadence` turns):
 Multi-pass `.chat()` reasoning about the user, appended after base context.
 
-Both layers are joined, then truncated to fit `contextTokens` budget via `_truncate_to_budget` (tokens × 4 chars, word-boundary safe).
+The configured `contextTokens` value is passed to Honcho's `session.context(tokens=...)`
+so the server can choose a fitting summary and recent-message allocation. The
+combined Hermes memory block is then truncated to the same budget as a final
+client-side backstop (tokens × 4 chars, word-boundary safe).
 
 ### Latest-Message Query Rewrite (opt-in)
 
@@ -222,7 +225,8 @@ Pick **[e]** at the prompt to set the three keys directly instead of going throu
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `sessionStrategy` | string | `"per-directory"` | `"per-directory"`, `"per-session"`, `"per-repo"` (git root), `"global"` |
-| `sessionPeerPrefix` | bool | `false` | Prepend peer name to session keys |
+| `sessionPeerPrefix` | bool | `false` | Prepend the user peer name to session keys |
+| `sessionAiPeerPrefix` | bool | `false` | Prepend `aiPeer` to every resolved session key, including gateway keys |
 | `sessions` | object | `{}` | Manual directory-to-session-name mappings |
 
 #### Session Name Resolution
@@ -241,7 +245,12 @@ The Honcho session name determines which conversation bucket memory lands in. Re
 
 Gateway platforms always resolve via priority 3 (per-chat isolation) regardless of `sessionStrategy`. The strategy setting only affects CLI sessions.
 
-If `sessionPeerPrefix` is `true`, the peer name is prepended: `alice-hermes-agent`.
+If `sessionPeerPrefix` is `true`, the user peer name is prepended: `alice-hermes-agent`.
+
+If `sessionAiPeerPrefix` is `true`, the configured AI peer is prepended after
+normal session resolution. This also applies to gateway chat keys, preventing
+different Hermes profiles from sharing one Honcho summary merely because the
+platform exposes the same user/chat ID to every bot.
 
 #### What each strategy produces
 

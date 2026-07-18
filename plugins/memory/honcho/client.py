@@ -454,6 +454,10 @@ class HonchoClientConfig:
     # Session resolution
     session_strategy: str = "per-directory"
     session_peer_prefix: bool = False
+    # Prefix every resolved session with the configured AI peer. This keeps
+    # gateway sessions disjoint when several Hermes profiles share the same
+    # workspace, user peer, and platform chat key.
+    session_ai_peer_prefix: bool = False
     sessions: dict[str, str] = field(default_factory=dict)
     # Raw global config for anything else consumers need
     raw: dict[str, Any] = field(default_factory=dict)
@@ -585,6 +589,11 @@ class HonchoClientConfig:
         session_peer_prefix = (
             host_prefix if host_prefix is not None
             else raw.get("sessionPeerPrefix", False)
+        )
+        host_ai_prefix = host_block.get("sessionAiPeerPrefix")
+        session_ai_peer_prefix = (
+            host_ai_prefix if host_ai_prefix is not None
+            else raw.get("sessionAiPeerPrefix", False)
         )
 
         return cls(
@@ -730,6 +739,7 @@ class HonchoClientConfig:
             ),
             session_strategy=session_strategy,
             session_peer_prefix=session_peer_prefix,
+            session_ai_peer_prefix=session_ai_peer_prefix,
             sessions=raw.get("sessions", {}),
             raw=raw,
             explicitly_configured=_explicitly_configured,
@@ -792,7 +802,30 @@ class HonchoClientConfig:
         session_id: str | None = None,
         gateway_session_key: str | None = None,
     ) -> str | None:
-        """Resolve Honcho session name.
+        """Resolve the Honcho session name and apply the optional AI prefix."""
+        result = self._resolve_session_name_base(
+            cwd=cwd,
+            session_title=session_title,
+            session_id=session_id,
+            gateway_session_key=gateway_session_key,
+        )
+        if result and self.session_ai_peer_prefix and self.ai_peer:
+            import re
+
+            ai = re.sub(r'[^a-zA-Z0-9_-]+', '-', self.ai_peer).strip('-')
+            if ai:
+                prefixed = f"{ai}-{result}"
+                return self._enforce_session_id_limit(prefixed, prefixed)
+        return result
+
+    def _resolve_session_name_base(
+        self,
+        cwd: str | None = None,
+        session_title: str | None = None,
+        session_id: str | None = None,
+        gateway_session_key: str | None = None,
+    ) -> str | None:
+        """Resolve the base Honcho session name without an AI-peer prefix.
 
         Resolution order:
           1. Gateway session key (stable per-chat identifier from gateway platforms)

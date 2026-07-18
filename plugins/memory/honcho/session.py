@@ -96,7 +96,11 @@ class HonchoSessionManager:
             runtime_user_peer_name_alt: Optional stable alternate gateway identity.
         """
         self._honcho = honcho
-        self._context_tokens = context_tokens
+        self._context_tokens = (
+            context_tokens
+            if context_tokens is not None
+            else getattr(config, "context_tokens", None)
+        )
         self._config = config
         self._runtime_user_peer_name = runtime_user_peer_name
         self._runtime_user_peer_name_alt = runtime_user_peer_name_alt
@@ -749,7 +753,10 @@ class HonchoSessionManager:
         try:
             honcho_session = self._sessions_cache.get(session.honcho_session_id)
             if honcho_session:
-                ctx = honcho_session.context(summary=True)
+                ctx = honcho_session.context(
+                    summary=True,
+                    tokens=self._context_tokens,
+                )
                 if ctx.summary and getattr(ctx.summary, "content", None):
                     result["summary"] = ctx.summary.content
         except Exception as e:
@@ -1037,6 +1044,7 @@ class HonchoSessionManager:
             observer_peer_id, target_peer_id = self._resolve_observer_target(session, peer)
             ctx = honcho_session.context(
                 summary=True,
+                tokens=self._context_tokens,
                 peer_target=target_peer_id or observer_peer_id,
                 peer_perspective=observer_peer_id,
             )

@@ -38,6 +38,7 @@ def _manager_with_cached_session(*, ai_observe_others=True):
         ai_observe_others=ai_observe_others,
         message_max_chars=25000,
         dialectic_max_input_chars=10000,
+        context_tokens=4000,
     )
     mgr = HonchoSessionManager(honcho=SimpleNamespace(), config=cfg)
     session = HonchoSession(
@@ -52,6 +53,15 @@ def _manager_with_cached_session(*, ai_observe_others=True):
     return mgr, fake_honcho_session
 
 
+def test_prefetch_context_passes_server_side_token_budget():
+    mgr, fake = _manager_with_cached_session(ai_observe_others=True)
+
+    result = mgr.get_prefetch_context("test-session", user_message="current topic")
+
+    assert result["summary"] == "summary"
+    assert fake.calls == [{"summary": True, "tokens": 4000}]
+
+
 def test_session_context_user_alias_uses_assistant_observer_when_ai_can_observe_others():
     mgr, fake = _manager_with_cached_session(ai_observe_others=True)
 
@@ -61,6 +71,7 @@ def test_session_context_user_alias_uses_assistant_observer_when_ai_can_observe_
     assert fake.calls == [
         {
             "summary": True,
+            "tokens": 4000,
             "peer_target": "chris",
             "peer_perspective": "hermes",
         }
@@ -75,6 +86,7 @@ def test_session_context_explicit_user_peer_matches_user_alias():
     assert fake.calls == [
         {
             "summary": True,
+            "tokens": 4000,
             "peer_target": "chris",
             "peer_perspective": "hermes",
         }
@@ -89,6 +101,7 @@ def test_session_context_user_alias_uses_user_self_observer_when_ai_cannot_obser
     assert fake.calls == [
         {
             "summary": True,
+            "tokens": 4000,
             "peer_target": "chris",
             "peer_perspective": "chris",
         }

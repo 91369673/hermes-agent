@@ -45,7 +45,7 @@ def clone_honcho_for_profile(profile_name: str) -> bool:
     # carry the operator's runtime-to-peer routing intent from #27371.
     new_block = {}
     for key in ("recallMode", "writeFrequency", "sessionStrategy",
-                "sessionPeerPrefix", "contextTokens", "dialecticReasoningLevel",
+                "sessionPeerPrefix", "sessionAiPeerPrefix", "contextTokens", "dialecticReasoningLevel",
                 "dialecticDynamic", "dialecticMaxChars", "messageMaxChars",
                 "dialecticMaxInputChars", "saveMessages", "observation",
                 "pinUserPeer", "userPeerAliases", "runtimePeerPrefix"):
@@ -115,7 +115,8 @@ def cmd_enable(args) -> None:
     if not block.get("aiPeer"):
         default_block = cfg_get(cfg, "hosts", HOST, default={})
         for key in ("recallMode", "writeFrequency", "sessionStrategy",
-                    "contextTokens", "dialecticReasoningLevel", "dialecticDynamic",
+                    "sessionPeerPrefix", "sessionAiPeerPrefix", "contextTokens",
+                    "dialecticReasoningLevel", "dialecticDynamic",
                     "dialecticMaxChars", "messageMaxChars", "dialecticMaxInputChars",
                     "saveMessages", "observation"):
             val = default_block.get(key)
