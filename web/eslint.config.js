@@ -19,5 +19,12 @@ export default defineConfig([
       ecmaVersion: 2020,
       globals: globals.browser,
     },
+    // Keep the ESLint 10 upgrade behavior-equivalent to the prior
+    // @eslint/js 9 recommended ruleset.
+    rules: {
+      'no-unassigned-vars': 'off',
+      'no-useless-assignment': 'off',
+      'preserve-caught-error': 'off',
+    },
   },
 ])
