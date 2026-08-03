@@ -1,6 +1,6 @@
 import type { MutableRefObject } from 'react'
 import { useCallback, useRef } from 'react'
-import type { NavigateFunction } from 'react-router-dom'
+import type { NavigateFunction } from 'react-router'
 
 import { deleteSession, getSessionMessages, setSessionArchived } from '@/hermes'
 import { useI18n } from '@/i18n'

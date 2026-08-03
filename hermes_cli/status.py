@@ -441,6 +441,7 @@ def show_status(args):
         "WhatsApp": ("WHATSAPP_ENABLED", None),
         "Signal": ("SIGNAL_HTTP_URL", "SIGNAL_HOME_CHANNEL"),
         "Slack": ("SLACK_BOT_TOKEN", None),
+        "Mattermost": ("MATTERMOST_TOKEN", "MATTERMOST_HOME_CHANNEL"),
         "Email": ("EMAIL_ADDRESS", "EMAIL_HOME_ADDRESS"),
         "SMS": ("TWILIO_ACCOUNT_SID", "SMS_HOME_CHANNEL"),
         "DingTalk": ("DINGTALK_CLIENT_ID", None),
@@ -470,11 +471,37 @@ def show_status(args):
         
         print(f"  {name:<12}  {check_mark(has_token)} {status}")
 
+    displayed_platform_labels = set(platforms)
+    displayed_platform_keys = {
+        "telegram", "discord", "whatsapp", "signal", "slack", "mattermost",
+        "email", "sms", "dingtalk", "feishu", "wecom", "wecom_callback",
+        "weixin", "bluebubbles", "qqbot", "yuanbao",
+    }
+
     # Plugin-registered platforms
     try:
+        # Status should reflect the same platform registry that gateway setup
+        # and runtime use. Discovery is intentionally idempotent; without it,
+        # migrated platform plugins can be active in the gateway but absent
+        # from `hermes status --all`.
+        from hermes_cli.plugins import discover_plugins
+        discover_plugins()
+
         from gateway.platform_registry import platform_registry
         for entry in platform_registry.plugin_entries():
-            configured = entry.check_fn()
+            if entry.label in displayed_platform_labels or entry.name in displayed_platform_keys:
+                continue
+            if entry.is_connected is not None:
+                try:
+                    from gateway.config import PlatformConfig
+                    configured = bool(entry.is_connected(PlatformConfig(enabled=True)))
+                except Exception:
+                    configured = False
+            else:
+                try:
+                    configured = bool(entry.check_fn())
+                except Exception:
+                    configured = False
             status_str = "configured" if configured else "not configured"
             label = entry.label
             print(f"  {label:<12}  {check_mark(configured)} {status_str} (plugin)")
