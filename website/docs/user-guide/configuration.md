@@ -2326,6 +2326,15 @@ browser:
   # browser via /browser connect). Ignored on Camofox and default local agent-browser mode.
   dialog_policy: must_respond    # must_respond | auto_dismiss | auto_accept
   dialog_timeout_s: 300          # Safety auto-dismiss under must_respond (seconds)
+  # Optional Browser Use local isolation. "existing" keeps the upstream
+  # attach-to-running-Chrome flow; "isolated" launches one persistent Chrome
+  # user-data-dir per browser_exec session name on an ephemeral loopback CDP port.
+  local_chrome:
+    mode: existing               # existing | isolated
+    headless: false
+    profile_root: ""              # default: $HERMES_HOME/browser_profiles/chrome
+    executable_path: ""           # auto-detect Google Chrome/Chromium when blank
+    startup_timeout: 20
   camofox:
     managed_persistence: false   # When true, Camofox sessions persist cookies/logins across restarts
     user_id: ""                  # Optional externally managed Camofox userId

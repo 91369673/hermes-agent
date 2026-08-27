@@ -552,6 +552,17 @@ DEFAULT_CONFIG = {
         # website/docs/developer-guide/browser-supervisor.md.
         "dialog_policy": "must_respond",  # must_respond | auto_dismiss | auto_accept
         "dialog_timeout_s": 300,  # Safety auto-dismiss after N seconds under must_respond
+        # Browser Use local source. "existing" preserves the upstream
+        # attach-to-running-Chrome flow. "isolated" launches one persistent,
+        # profile-scoped Chrome user-data-dir per browser_exec session name on
+        # an ephemeral loopback CDP port.
+        "local_chrome": {
+            "mode": "existing",  # existing | isolated
+            "headless": False,
+            "profile_root": "",  # default: $HERMES_HOME/browser_profiles/chrome
+            "executable_path": "",  # auto-detect Google Chrome/Chromium
+            "startup_timeout": 20,
+        },
         "camofox": {
             # When true, Hermes sends a stable profile-scoped userId to Camofox
             # so the server maps it to a persistent Firefox profile automatically.

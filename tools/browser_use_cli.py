@@ -14,6 +14,10 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+from tools.isolated_chrome_sessions import (
+    ensure_session as _ensure_isolated_chrome_session,
+    is_enabled as _isolated_local_chrome_enabled,
+)
 from utils import is_truthy_value
 
 logger = logging.getLogger(__name__)
@@ -495,12 +499,29 @@ def _resolve_backend_cdp(
         env["BU_CDP_URL" if override.startswith(("http://", "https://")) else "BU_CDP_WS"] = override
         return None
 
+    browser_cfg = _read_browser_cfg()
     try:
         provider = _get_cloud_provider()
     except Exception as e:
         logger.debug("Cloud provider lookup failed: %s", e)
         provider = None
     if provider is None:
+        local_provider = str(browser_cfg.get("cloud_provider") or "local").strip().lower()
+        if local_provider == "local" and _isolated_local_chrome_enabled(browser_cfg):
+            try:
+                isolated = _ensure_isolated_chrome_session(
+                    session_name or "default",
+                    browser_cfg=browser_cfg,
+                )
+            except Exception as exc:
+                return f"Failed to start isolated local Chrome session: {exc}"
+            env["BU_CDP_URL"] = isolated.cdp_url
+            # Browser Harness daemon names are process-global, while Hermes
+            # profiles have separate HERMES_HOME roots.  The manager's name
+            # includes a profile-root digest so equally named sessions in two
+            # Hermes profiles cannot share one daemon by accident.
+            env["BU_NAME"] = isolated.daemon_name
+            env[_PRIVATE_BROWSER_SENTINEL] = "1"
         return None
 
     # Browser Use direct-API configs: the CLI talks to Browser Use cloud
@@ -511,7 +532,7 @@ def _resolve_backend_cdp(
     # returns its CDP URL, giving subscribers CLI mode with no raw key.
     provider_key = str(getattr(provider, "name", "") or "").strip().lower()
     if provider_key == _BACKEND_KEY and not is_truthy_value(
-        _read_browser_cfg().get("use_gateway"), default=False
+        browser_cfg.get("use_gateway"), default=False
     ):
         # Named BU cloud browsers are exclusive to their daemon — no shared
         # tab to isolate from.
@@ -700,7 +721,10 @@ _HEADER_BASE = (
     "call, so progress survives timeouts. For an isolated concurrent "
     "browser session (parallel tasks that must not share tabs), pass "
     "session=<name> (never BU_NAME env syntax) and reuse the same name on "
-    "every related call."
+    "every related call. When browser.local_chrome.mode=isolated, that name "
+    "is also the persistent Chrome profile identity: different names can "
+    "hold different simultaneous logins to the same site; reuse the exact "
+    "name to keep its cookies and login state."
 )
 
 _HEADER_VISION = (
