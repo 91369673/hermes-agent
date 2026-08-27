@@ -19,6 +19,7 @@ Usage::
     hermes profile delete coder          # remove profile + alias + service
 """
 
+import copy
 import json
 import logging
 import os
@@ -31,7 +32,9 @@ import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath, PureWindowsPath
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
+
+import yaml
 
 from agent.skill_utils import is_excluded_skill_path
 
@@ -540,6 +543,91 @@ def _migrate_profile_config_if_outdated(profile_dir: Path) -> None:
         # Profile creation should not fail because an old copied config could
         # not be migrated. The next `hermes doctor --fix` can still surface the
         # detailed error in the target profile.
+        pass
+
+
+def _load_installation_profile_defaults() -> Dict[str, Any]:
+    """Read policy defaults applied to every newly-created named profile."""
+    config_path = _get_default_hermes_home() / "config.yaml"
+    if not config_path.exists():
+        return {}
+
+    try:
+        raw = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+    except (OSError, yaml.YAMLError) as exc:
+        raise ValueError(f"cannot read installation profile_defaults: {exc}") from exc
+    if not isinstance(raw, dict):
+        raise ValueError("default config.yaml must be a mapping")
+
+    defaults = raw.get("profile_defaults")
+    if defaults is None:
+        return {}
+    if not isinstance(defaults, dict):
+        raise ValueError("profile_defaults must be a mapping")
+    reserved = {"_config_version", "profile_defaults"}.intersection(defaults)
+    if reserved:
+        names = ", ".join(sorted(reserved))
+        raise ValueError(f"profile_defaults cannot contain reserved key(s): {names}")
+    return copy.deepcopy(defaults)
+
+
+def _deep_merge_profile_policy(target: Dict[str, Any], policy: Dict[str, Any]) -> None:
+    """Merge policy into target with policy values winning at every leaf."""
+    for key, value in policy.items():
+        current = target.get(key)
+        if isinstance(current, dict) and isinstance(value, dict):
+            _deep_merge_profile_policy(current, value)
+        else:
+            target[key] = copy.deepcopy(value)
+
+
+def _apply_installation_profile_defaults(
+    profile_dir: Path,
+    defaults: Dict[str, Any],
+) -> None:
+    """Apply installation policy last without copying policy metadata."""
+    config_path = profile_dir / "config.yaml"
+    config_is_symlink = config_path.is_symlink()
+    if not config_path.exists():
+        if config_is_symlink and defaults:
+            raise ValueError(f"profile config symlink target is missing: {config_path}")
+        if not defaults:
+            return
+
+    if config_path.exists():
+        try:
+            config = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+        except (OSError, yaml.YAMLError) as exc:
+            raise ValueError(f"cannot apply profile_defaults to {config_path}: {exc}") from exc
+        if not isinstance(config, dict):
+            raise ValueError(f"profile config must be a mapping: {config_path}")
+    else:
+        config = {}
+
+    changed = "profile_defaults" in config
+    config.pop("profile_defaults", None)
+    if defaults:
+        _deep_merge_profile_policy(config, defaults)
+        changed = True
+    if not changed:
+        return
+
+    if "_config_version" not in config:
+        from hermes_cli.config import DEFAULT_CONFIG
+
+        config["_config_version"] = DEFAULT_CONFIG["_config_version"]
+
+    from utils import atomic_yaml_write
+
+    # clone-all deliberately preserves symlinks, but installation policy must
+    # never write through a cloned config link and mutate the source profile or
+    # an external dotfiles target. Detach only when this call will write.
+    if config_is_symlink:
+        config_path.unlink()
+    atomic_yaml_write(config_path, config)
+    try:
+        os.chmod(config_path, 0o600)
+    except OSError:
         pass
 
 
@@ -1125,6 +1213,11 @@ def create_profile(
     if profile_dir.exists():
         raise FileExistsError(f"Profile '{canon}' already exists at {profile_dir}")
 
+    # Validate installation policy before any profile directory is created.
+    # Policy is read only from the default installation home, never from a
+    # clone source, and is applied last so it remains an enforceable baseline.
+    profile_defaults = _load_installation_profile_defaults()
+
     # Resolve clone source
     source_dir = None
     if clone_from is not None or clone_all or clone_config:
@@ -1240,6 +1333,7 @@ def create_profile(
     # explicit runtime/history stripping above.
     if not clone_all:
         _migrate_profile_config_if_outdated(profile_dir)
+    _apply_installation_profile_defaults(profile_dir, profile_defaults)
 
     # Persist description if the caller provided one. Done last so a
     # partial-create failure doesn't strand a description file in an
@@ -1381,7 +1475,7 @@ def _profile_bound_backend_pids(canon: str, profile_dir: Path) -> list[int]:
     inspect anything.
     """
     try:
-        import psutil  # type: ignore
+        import psutil
     except Exception:
         return []
 
@@ -2298,6 +2392,8 @@ def import_profile(archive_path: str, name: Optional[str] = None) -> Path:
     if profile_dir.exists():
         raise FileExistsError(f"Profile '{canon}' already exists at {profile_dir}")
 
+    profile_defaults = _load_installation_profile_defaults()
+
     profiles_root = _get_profiles_root()
     profiles_root.mkdir(parents=True, exist_ok=True)
 
@@ -2316,6 +2412,7 @@ def import_profile(archive_path: str, name: Optional[str] = None) -> Path:
             final_source = staging_root / canon
             extracted.rename(final_source)
 
+        _apply_installation_profile_defaults(final_source, profile_defaults)
         shutil.move(str(final_source), str(profile_dir))
 
     return profile_dir
