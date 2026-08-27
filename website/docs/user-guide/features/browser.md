@@ -76,6 +76,49 @@ The mode is a **driver** that composes with your configured browser backend: it 
 
 **Concurrent sessions:** `browser_exec` accepts a `session=<name>` argument that isolates browser work per name on every backend. Each name gets its own harness daemon (its own IPC socket, log, and state), and on cloud backends its own browser — so parallel subagents or simultaneous chats no longer clobber a single shared connection. Omitting `session` uses the shared default daemon, which is fine for one-at-a-time browsing.
 
+#### Profile-isolated local Chrome sessions
+
+The normal local Browser Use flow attaches to the Chrome instance you already
+have open. Chrome may require `chrome://inspect/#remote-debugging` consent for
+that personal profile. To keep automation independent from your normal browser,
+enable Hermes-managed isolated Chrome sessions:
+
+```yaml
+browser:
+  backend: browser-use
+  cloud_provider: local
+  local_chrome:
+    mode: isolated
+    headless: false
+    # Optional; defaults to $HERMES_HOME/browser_profiles/chrome
+    profile_root: ""
+    # Optional; auto-detected on macOS/Linux/Windows
+    executable_path: ""
+    startup_timeout: 20
+```
+
+Hermes then launches the installed Google Chrome/Chromium executable with a
+dedicated persistent `--user-data-dir`, an ephemeral CDP port bound to
+`127.0.0.1`, and a Browser Harness daemon name scoped to the active Hermes
+profile. It never reads or attaches to the normal Chrome data directory.
+
+- The same `session=<name>` reuses the same profile, cookies, and login state.
+- Different names get different Chrome processes and can hold different logins
+  to the same site simultaneously.
+- Session names are case-insensitive on macOS and Windows (`Work` = `work`) so
+  case-only aliases cannot control the same physical profile twice.
+- An omitted name maps to the profile-local `default` automation identity.
+- Chrome receives the real OS account `HOME`, even when a Hermes profile uses a
+  synthetic HOME, so macOS Keychain-backed browser/login helpers keep working.
+- Profiles remain on disk across Chrome, Hermes, and machine restarts. CDP is
+  exposed only while the isolated Chrome process is running and only on loopback.
+
+Use stable, purpose-specific names such as `seller-us`, `seller-jp`, or
+`finance`; do not generate a fresh name per call if you want login persistence.
+Any local process owned by the same OS user can connect to a loopback CDP port,
+so keep sensitive accounts in separate automation profiles and do not reuse
+your personal Chrome `Default` profile.
+
 To opt out and force the built-in browser tools, use `/browser use off`, or:
 
 ```yaml

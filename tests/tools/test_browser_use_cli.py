@@ -15,6 +15,7 @@ import json
 import os
 import stat
 import time
+from types import SimpleNamespace
 
 import pytest
 
@@ -26,6 +27,10 @@ def _clean_env(monkeypatch):
     monkeypatch.delenv("BU_NAME", raising=False)
     monkeypatch.delenv("BU_AUTOSPAWN", raising=False)
     monkeypatch.delenv("BROWSER_USE_API_KEY", raising=False)
+    # Keep browser tests hermetic after an operator enables isolated local
+    # Chrome in their real config. Tests that exercise the feature opt in by
+    # monkeypatching this gate to True.
+    monkeypatch.setattr(bu_cli, "_isolated_local_chrome_enabled", lambda cfg: False)
     yield
 
 
@@ -373,6 +378,50 @@ class TestBackendCdpResolution:
         env = self._env()
         assert bu_cli._resolve_backend_cdp(env, "t1") is None
         assert "BU_CDP_WS" not in env and "BU_CDP_URL" not in env
+
+    def test_isolated_local_mode_exports_private_cdp_and_namespaced_daemon(
+        self, monkeypatch
+    ):
+        import tools.browser_tool as bt
+
+        monkeypatch.setattr(bt, "_get_cdp_override", lambda: "")
+        monkeypatch.setattr(bt, "_get_cloud_provider", lambda: None)
+        monkeypatch.setattr(
+            bu_cli,
+            "_read_browser_cfg",
+            lambda: {"cloud_provider": "local", "local_chrome": {"mode": "isolated"}},
+        )
+        monkeypatch.setattr(bu_cli, "_isolated_local_chrome_enabled", lambda cfg: True)
+        monkeypatch.setattr(
+            bu_cli,
+            "_ensure_isolated_chrome_session",
+            lambda name, browser_cfg=None: SimpleNamespace(
+                cdp_url="http://127.0.0.1:40123",
+                daemon_name="hermes-a1b2c3-research",
+            ),
+        )
+        env = {"BU_NAME": "research"}
+        assert bu_cli._resolve_backend_cdp(env, "task", session_name="research") is None
+        assert env["BU_CDP_URL"] == "http://127.0.0.1:40123"
+        assert env["BU_NAME"] == "hermes-a1b2c3-research"
+        assert env[bu_cli._PRIVATE_BROWSER_SENTINEL] == "1"
+
+    def test_isolated_local_mode_failure_is_actionable(self, monkeypatch):
+        import tools.browser_tool as bt
+
+        monkeypatch.setattr(bt, "_get_cdp_override", lambda: "")
+        monkeypatch.setattr(bt, "_get_cloud_provider", lambda: None)
+        monkeypatch.setattr(bu_cli, "_isolated_local_chrome_enabled", lambda cfg: True)
+        monkeypatch.setattr(
+            bu_cli,
+            "_ensure_isolated_chrome_session",
+            lambda *a, **k: (_ for _ in ()).throw(
+                RuntimeError("Chrome did not publish DevToolsActivePort")
+            ),
+        )
+        err = bu_cli._resolve_backend_cdp({}, "task", session_name="research")
+        assert err and "isolated local Chrome" in err
+        assert "DevToolsActivePort" in err
 
     def test_provider_failure_returns_error(self, monkeypatch):
         import tools.browser_tool as bt
