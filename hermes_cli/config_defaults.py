@@ -518,6 +518,11 @@ DEFAULT_CONFIG = {
         "provider_tier": {},
     },
 
+    # Open installation-policy mapping merged into every newly-created or
+    # imported named profile. It must stay empty by default: materializing
+    # placeholder leaves here would become an active override policy.
+    "profile_defaults": {},
+
     "browser": {
         # Browser tool implementation.
         # ""            — DEFAULT: Browser Use mode when the browser-use CLI

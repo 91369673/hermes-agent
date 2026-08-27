@@ -114,6 +114,177 @@ class TestGetProfileDir:
 class TestCreateProfile:
     """Tests for create_profile()."""
 
+    def test_fresh_profile_applies_installation_profile_defaults(self, profile_env):
+        default_home = profile_env / ".hermes"
+        (default_home / "config.yaml").write_text(
+            yaml.safe_dump(
+                {
+                    "profile_defaults": {
+                        "browser": {
+                            "backend": "browser-use",
+                            "cloud_provider": "local",
+                            "local_chrome": {"mode": "isolated", "headless": False},
+                        }
+                    }
+                },
+                sort_keys=False,
+            ),
+            encoding="utf-8",
+        )
+
+        profile_dir = create_profile("coder", no_alias=True)
+        config = yaml.safe_load((profile_dir / "config.yaml").read_text())
+
+        assert config["_config_version"] == DEFAULT_CONFIG["_config_version"]
+        assert config["browser"] == {
+            "backend": "browser-use",
+            "cloud_provider": "local",
+            "local_chrome": {"mode": "isolated", "headless": False},
+        }
+        assert "profile_defaults" not in config
+
+    def test_profile_defaults_override_clone_config_without_copying_policy(self, profile_env):
+        default_home = profile_env / ".hermes"
+        (default_home / "config.yaml").write_text(
+            yaml.safe_dump(
+                {
+                    "model": {"default": "test-model"},
+                    "browser": {"local_chrome": {"mode": "existing"}},
+                    "profile_defaults": {
+                        "browser": {
+                            "backend": "browser-use",
+                            "local_chrome": {"mode": "isolated", "headless": False},
+                        }
+                    },
+                },
+                sort_keys=False,
+            ),
+            encoding="utf-8",
+        )
+
+        profile_dir = create_profile("coder", clone_config=True, no_alias=True)
+        config = yaml.safe_load((profile_dir / "config.yaml").read_text())
+
+        assert config["model"]["default"] == "test-model"
+        assert config["browser"]["local_chrome"] == {
+            "mode": "isolated",
+            "headless": False,
+        }
+        assert config["browser"]["backend"] == "browser-use"
+        assert "profile_defaults" not in config
+
+    def test_profile_defaults_override_clone_all_config(self, profile_env):
+        default_home = profile_env / ".hermes"
+        (default_home / "config.yaml").write_text(
+            yaml.safe_dump(
+                {
+                    "profile_defaults": {
+                        "browser": {"local_chrome": {"mode": "isolated"}}
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        source = create_profile("source", no_alias=True)
+        (source / "config.yaml").write_text(
+            yaml.safe_dump({"browser": {"local_chrome": {"mode": "existing"}}}),
+            encoding="utf-8",
+        )
+
+        target = create_profile(
+            "snapshot",
+            clone_from="source",
+            clone_all=True,
+            no_alias=True,
+        )
+        config = yaml.safe_load((target / "config.yaml").read_text())
+
+        assert config["browser"]["local_chrome"]["mode"] == "isolated"
+        assert "profile_defaults" not in config
+
+    def test_profile_defaults_detach_clone_all_config_symlink(self, profile_env):
+        default_home = profile_env / ".hermes"
+        (default_home / "config.yaml").write_text(
+            yaml.safe_dump(
+                {
+                    "profile_defaults": {
+                        "browser": {"local_chrome": {"mode": "isolated"}}
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        source = create_profile("source", no_alias=True)
+        shared_config = profile_env / "shared-config.yaml"
+        shared_config.write_text(
+            yaml.safe_dump({"browser": {"local_chrome": {"mode": "existing"}}}),
+            encoding="utf-8",
+        )
+        source_config = source / "config.yaml"
+        source_config.unlink()
+        source_config.symlink_to(shared_config)
+
+        target = create_profile(
+            "snapshot",
+            clone_from="source",
+            clone_all=True,
+            no_alias=True,
+        )
+        target_config = target / "config.yaml"
+        config = yaml.safe_load(target_config.read_text())
+        shared = yaml.safe_load(shared_config.read_text())
+
+        assert source_config.is_symlink()
+        assert not target_config.is_symlink()
+        assert shared["browser"]["local_chrome"]["mode"] == "existing"
+        assert config["browser"]["local_chrome"]["mode"] == "isolated"
+
+    def test_no_profile_defaults_preserves_fresh_profile_behavior(self, profile_env):
+        profile_dir = create_profile("coder", no_alias=True)
+        assert not (profile_dir / "config.yaml").exists()
+
+    def test_profile_defaults_schema_is_empty_open_mapping(self):
+        assert DEFAULT_CONFIG["profile_defaults"] == {}
+
+    def test_null_profile_defaults_metadata_is_removed_from_clone_all(self, profile_env):
+        default_home = profile_env / ".hermes"
+        (default_home / "config.yaml").write_text(
+            yaml.safe_dump({"profile_defaults": None}),
+            encoding="utf-8",
+        )
+        source = create_profile("source", no_alias=True)
+        (source / "config.yaml").write_text(
+            yaml.safe_dump(
+                {
+                    "model": {"default": "keep-me"},
+                    "profile_defaults": None,
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        profile_dir = create_profile(
+            "snapshot",
+            clone_from="source",
+            clone_all=True,
+            no_alias=True,
+        )
+        config = yaml.safe_load((profile_dir / "config.yaml").read_text())
+
+        assert config["model"]["default"] == "keep-me"
+        assert "profile_defaults" not in config
+
+    def test_invalid_profile_defaults_fail_before_profile_creation(self, profile_env):
+        default_home = profile_env / ".hermes"
+        (default_home / "config.yaml").write_text(
+            yaml.safe_dump({"profile_defaults": ["not", "a", "mapping"]}),
+            encoding="utf-8",
+        )
+
+        with pytest.raises(ValueError, match="profile_defaults must be a mapping"):
+            create_profile("coder", no_alias=True)
+        assert not (default_home / "profiles" / "coder").exists()
+
 
     def test_seeds_placeholder_env_file(self, profile_env):
         """Fresh profiles get their own .env (owner-only) so channel/env
@@ -714,6 +885,33 @@ class TestRenameProfile:
 class TestExportImport:
     """Tests for export_profile() / import_profile()."""
 
+    def test_import_applies_installation_profile_defaults(self, profile_env, tmp_path):
+        default_home = profile_env / ".hermes"
+        (default_home / "config.yaml").write_text(
+            yaml.safe_dump(
+                {
+                    "profile_defaults": {
+                        "browser": {"local_chrome": {"mode": "isolated"}}
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        source_root = tmp_path / "archive-source" / "legacy"
+        source_root.mkdir(parents=True)
+        (source_root / "config.yaml").write_text(
+            yaml.safe_dump({"browser": {"local_chrome": {"mode": "existing"}}}),
+            encoding="utf-8",
+        )
+        archive = tmp_path / "legacy.tar.gz"
+        with tarfile.open(archive, "w:gz") as tf:
+            tf.add(source_root, arcname="legacy")
+
+        profile_dir = import_profile(str(archive), name="imported")
+        config = yaml.safe_load((profile_dir / "config.yaml").read_text())
+
+        assert config["browser"]["local_chrome"]["mode"] == "isolated"
+        assert "profile_defaults" not in config
 
 
 

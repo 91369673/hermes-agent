@@ -32,6 +32,21 @@ That's it. `coder` is now its own Hermes profile with its own config, memory, an
 Quickest setup: run `hermes setup --portal` inside the new profile to wire up models + tools at once. See [Nous Portal](/integrations/nous-portal).
 :::
 
+### Installation-wide defaults for new profiles
+
+The default installation can enforce a configuration baseline for every newly-created or imported named profile through `profile_defaults` in `~/.hermes/config.yaml`. The policy is applied **last** to blank profiles, config clones, `--clone-all` snapshots, and imports, so its values override the source. The `profile_defaults` metadata itself is not copied to child profiles.
+
+For example, make every future profile use an isolated local Google Chrome identity:
+
+```bash
+hermes config set profile_defaults.browser.backend browser-use
+hermes config set profile_defaults.browser.cloud_provider local
+hermes config set profile_defaults.browser.local_chrome.mode isolated
+hermes config set profile_defaults.browser.local_chrome.headless false
+```
+
+This affects profiles created afterward. Existing profiles keep their current configuration until you update them explicitly. A profile can still be changed after creation with `hermes -p <name> config set ...`.
+
 ### Blank profile
 
 ```bash
