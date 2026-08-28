@@ -13,8 +13,14 @@ Covers the three seams the integration relies on:
 """
 import json
 import os
+import shutil
+import socket
 import stat
+import tempfile
+import threading
 import time
+from contextlib import contextmanager
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -883,6 +889,255 @@ class TestBrowserExec:
         monkeypatch.setattr(bu_cli, "_MIN_TIMEOUT_S", 1)
         result = json.loads(bu_cli.browser_exec("print(1)", timeout_s=1))
         assert "timed out" in result["error"]
+
+    def test_isolated_exec_holds_activity_lease_and_touches_on_exit(
+        self, tmp_path, monkeypatch
+    ):
+        cli = _fake_cli(tmp_path, 'cat > /dev/null\necho "ok"\n')
+        cfg = {"cloud_provider": "local", "local_chrome": {"mode": "isolated"}}
+        layout = SimpleNamespace(session_name="default")
+        events = []
+
+        monkeypatch.setattr(bu_cli, "_find_cli", lambda: [cli])
+        monkeypatch.setattr(bu_cli, "_read_browser_cfg", lambda: cfg)
+        monkeypatch.setattr(bu_cli, "_isolated_local_chrome_enabled", lambda value: True)
+        monkeypatch.setattr(bu_cli, "_resolve_isolated_layout", lambda *a, **k: layout)
+        monkeypatch.setattr(
+            bu_cli, "_start_isolated_cleanup_worker", lambda *a, **k: None
+        )
+
+        @contextmanager
+        def fake_lease(candidate):
+            events.append(("enter", candidate))
+            yield None
+            events.append(("exit", candidate))
+
+        monkeypatch.setattr(bu_cli, "_isolated_activity_lease", fake_lease)
+        monkeypatch.setattr(
+            bu_cli,
+            "_touch_isolated_activity",
+            lambda candidate: events.append(("touch", candidate)),
+        )
+        monkeypatch.setattr(bu_cli, "_resolve_backend_cdp", lambda *a, **k: None)
+
+        raw = bu_cli.browser_exec("print(1)")
+        result = json.loads(raw) if isinstance(raw, str) else raw
+
+        assert result["success"] is True
+        assert events == [("enter", layout), ("touch", layout), ("exit", layout)]
+
+
+class TestIsolatedIdleCleanup:
+    @pytest.mark.skipif(os.name == "nt", reason="AF_UNIX regression")
+    def test_daemon_without_pid_identity_fails_closed_even_if_socket_is_unlinked(
+        self, monkeypatch
+    ):
+        layout = SimpleNamespace(daemon_name="hiso-pre-pid")
+        runtime = Path(tempfile.mkdtemp(prefix="bd-", dir="/tmp"))
+        endpoint = runtime / "bu.sock"
+        server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        server.bind(str(endpoint))
+        server.listen()
+        server.settimeout(0.1)
+        stop = threading.Event()
+
+        def serve_pre_pid_daemon():
+            while not stop.is_set():
+                try:
+                    client, _ = server.accept()
+                except TimeoutError:
+                    continue
+                except OSError:
+                    break
+                with client:
+                    client.recv(1 << 16)
+                    client.sendall(b'{"pong": true}\n')
+
+        thread = threading.Thread(target=serve_pre_pid_daemon, daemon=True)
+        thread.start()
+
+        def fake_reload(*args, **kwargs):
+            endpoint.unlink()
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        monkeypatch.setattr(bu_cli.subprocess, "run", fake_reload)
+        try:
+            assert bu_cli._stop_isolated_harness_daemon(
+                layout,
+                ["browser-use"],
+                {"BH_RUNTIME_DIR": str(runtime)},
+            ) is False
+            assert thread.is_alive()
+        finally:
+            stop.set()
+            server.close()
+            thread.join(timeout=1)
+            shutil.rmtree(runtime, ignore_errors=True)
+
+    def test_timeout_policy_preserves_every_valid_positive_value(self):
+        for value in (0.5, 30, 1800, 172800):
+            cfg = {"local_chrome": {"idle_timeout": value}}
+            assert bu_cli._isolated_idle_timeout(cfg) == value
+
+    def test_runtime_artifacts_follow_browser_harness_stem_rules(self, tmp_path):
+        layout = SimpleNamespace(daemon_name="hiso-test-idle")
+        per_instance = {"BH_RUNTIME_DIR": str(tmp_path / "instance")}
+        shared = {
+            "BH_RUNTIME_DIR": str(tmp_path / "shared"),
+            "BH_RUNTIME_DIR_SHARED": "1",
+        }
+        legacy_tmp = {"BH_TMP_DIR": str(tmp_path / "legacy")}
+
+        assert bu_cli._browser_harness_runtime_artifacts(layout, per_instance) == (
+            tmp_path / "instance" / "bu.pid",
+            tmp_path / "instance" / "bu.sock",
+        )
+        assert bu_cli._browser_harness_runtime_artifacts(layout, shared) == (
+            tmp_path / "shared" / "bu-hiso-test-idle.pid",
+            tmp_path / "shared" / "bu-hiso-test-idle.sock",
+        )
+        assert bu_cli._browser_harness_runtime_artifacts(layout, legacy_tmp) == (
+            tmp_path / "legacy" / "bu.pid",
+            tmp_path / "legacy" / "bu.sock",
+        )
+
+    def test_daemon_shutdown_exit_zero_is_not_enough_while_pid_lives(
+        self, tmp_path, monkeypatch
+    ):
+        layout = SimpleNamespace(daemon_name="hiso-test-idle")
+        runtime = tmp_path / "runtime"
+        runtime.mkdir()
+        (runtime / "bu.pid").write_text("4321")
+        process = SimpleNamespace(create_time=lambda: 10.0)
+        monkeypatch.setattr(bu_cli.psutil, "Process", lambda pid: process)
+        monkeypatch.setattr(bu_cli, "_identify_harness_daemon", lambda *a: None)
+        monkeypatch.setattr(bu_cli, "_process_identity_alive", lambda identity: True)
+        monkeypatch.setattr(
+            bu_cli.subprocess,
+            "run",
+            lambda *a, **k: SimpleNamespace(returncode=0, stdout="", stderr=""),
+        )
+        monotonic = iter((0.0, 11.0))
+        monkeypatch.setattr(bu_cli.time, "monotonic", lambda: next(monotonic))
+
+        assert bu_cli._stop_isolated_harness_daemon(
+            layout, ["browser-use"], {"BH_RUNTIME_DIR": str(runtime)}
+        ) is False
+
+    def test_missing_pid_uses_live_ipc_identity_before_shutdown(
+        self, tmp_path, monkeypatch
+    ):
+        layout = SimpleNamespace(daemon_name="hiso-test-idle")
+        identities = iter(((4321, 10.0), None))
+        monkeypatch.setattr(
+            bu_cli, "_identify_harness_daemon", lambda *a: next(identities)
+        )
+        monkeypatch.setattr(bu_cli, "_pid_file_identity", lambda path: None)
+        monkeypatch.setattr(bu_cli, "_process_identity_alive", lambda identity: False)
+        monkeypatch.setattr(
+            bu_cli.subprocess,
+            "run",
+            lambda *a, **k: SimpleNamespace(returncode=0, stdout="", stderr=""),
+        )
+
+        assert bu_cli._stop_isolated_harness_daemon(
+            layout,
+            ["browser-use"],
+            {"BH_RUNTIME_DIR": str(tmp_path / "runtime")},
+        ) is True
+
+    def test_cleanup_pass_uses_configured_generous_timeout(self, tmp_path, monkeypatch):
+        cfg = {"local_chrome": {"mode": "isolated", "idle_timeout": 1800}}
+        home = tmp_path / "hermes"
+        calls = []
+        monkeypatch.setattr(bu_cli, "_find_cli", lambda: ["/fake/browser-use"])
+        monkeypatch.setattr(bu_cli, "_existing_isolated_sessions", lambda **k: ["old"])
+
+        def fake_cleanup(name, **kwargs):
+            calls.append((name, kwargs))
+            return True
+
+        monkeypatch.setattr(bu_cli, "_cleanup_idle_isolated_session", fake_cleanup)
+        monkeypatch.setattr(bu_cli, "_stop_isolated_harness_daemon", lambda *a, **k: True)
+
+        assert bu_cli._cleanup_isolated_sessions(cfg, Path(home)) == 1
+        assert calls[0][0] == "old"
+        assert calls[0][1]["idle_timeout"] == 1800
+        assert calls[0][1]["hermes_home"] == home
+
+    def test_cleanup_pass_can_be_disabled_with_zero_timeout(self, tmp_path, monkeypatch):
+        cfg = {"local_chrome": {"mode": "isolated", "idle_timeout": 0}}
+        monkeypatch.setattr(
+            bu_cli,
+            "_existing_isolated_sessions",
+            lambda **k: (_ for _ in ()).throw(AssertionError("must not scan")),
+        )
+        assert bu_cli._cleanup_isolated_sessions(cfg, tmp_path) == 0
+
+    @pytest.mark.parametrize(
+        "fresh_cfg",
+        [
+            {"local_chrome": {"mode": "isolated", "idle_timeout": 0}},
+            {"local_chrome": {"mode": "existing", "idle_timeout": 1800}},
+        ],
+    )
+    def test_running_worker_honors_fresh_disable_config(
+        self, tmp_path, monkeypatch, fresh_cfg
+    ):
+        monkeypatch.setattr(
+            bu_cli, "_read_browser_cfg_for_home", lambda home: fresh_cfg
+        )
+        monkeypatch.setattr(
+            bu_cli,
+            "_cleanup_isolated_sessions",
+            lambda *a, **k: (_ for _ in ()).throw(
+                AssertionError("disabled worker must not sweep")
+            ),
+        )
+
+        assert bu_cli._cleanup_isolated_sessions_from_current_config(tmp_path) == 0
+
+    def test_worker_effective_config_expands_environment_zero_timeout(
+        self, tmp_path, monkeypatch
+    ):
+        home = tmp_path / "home"
+        home.mkdir()
+        (home / "config.yaml").write_text(
+            "browser:\n"
+            "  cloud_provider: local\n"
+            "  local_chrome:\n"
+            "    mode: isolated\n"
+            '    idle_timeout: "${IDLE_OFF}"\n'
+        )
+        monkeypatch.setenv("IDLE_OFF", "0")
+        cfg = bu_cli._read_browser_cfg_for_home(home)
+
+        assert cfg["local_chrome"]["mode"] == "isolated"
+        assert bu_cli._isolated_idle_timeout(cfg) == 0
+
+    def test_worker_effective_config_honors_managed_mode_change(
+        self, tmp_path, monkeypatch
+    ):
+        home = tmp_path / "home"
+        managed = tmp_path / "managed"
+        home.mkdir()
+        managed.mkdir()
+        (home / "config.yaml").write_text(
+            "browser:\n"
+            "  cloud_provider: local\n"
+            "  local_chrome:\n"
+            "    mode: isolated\n"
+        )
+        (managed / "config.yaml").write_text(
+            "browser:\n"
+            "  local_chrome:\n"
+            "    mode: existing\n"
+        )
+        monkeypatch.setenv("HERMES_MANAGED_DIR", str(managed))
+
+        cfg = bu_cli._read_browser_cfg_for_home(home)
+
+        assert cfg["local_chrome"]["mode"] == "existing"
 
 
 class TestFindCliManagedBin:

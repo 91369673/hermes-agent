@@ -567,6 +567,7 @@ DEFAULT_CONFIG = {
             "profile_root": "",  # default: $HERMES_HOME/browser_profiles/chrome
             "executable_path": "",  # auto-detect Google Chrome/Chromium
             "startup_timeout": 20,
+            "idle_timeout": 1800,  # close daemon + Chrome after 30 minutes idle; profile persists
         },
         "camofox": {
             # When true, Hermes sends a stable profile-scoped userId to Camofox

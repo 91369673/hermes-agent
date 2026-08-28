@@ -2335,6 +2335,7 @@ browser:
     profile_root: ""              # default: $HERMES_HOME/browser_profiles/chrome
     executable_path: ""           # auto-detect Google Chrome/Chromium when blank
     startup_timeout: 20
+    idle_timeout: 1800            # Close idle daemon + Chrome; keep the profile (0 disables)
   camofox:
     managed_persistence: false   # When true, Camofox sessions persist cookies/logins across restarts
     user_id: ""                  # Optional externally managed Camofox userId

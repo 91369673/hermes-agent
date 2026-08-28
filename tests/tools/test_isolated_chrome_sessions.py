@@ -31,6 +31,7 @@ def test_config_defaults_preserve_existing_chrome_attach_mode():
         "profile_root": "",
         "executable_path": "",
         "startup_timeout": 20,
+        "idle_timeout": 1800,
     }
 
 
@@ -67,6 +68,16 @@ def test_long_session_names_keep_distinct_daemon_identities(tmp_path):
     prior_a = iso.resolve_layout(collision_a, _cfg(), hermes_home=tmp_path)
     prior_b = iso.resolve_layout(collision_b, _cfg(), hermes_home=tmp_path)
     assert prior_a.daemon_name != prior_b.daemon_name
+
+
+def test_macos_daemon_name_fits_browser_harness_socket_budget(tmp_path, monkeypatch):
+    monkeypatch.setattr(iso.sys, "platform", "darwin")
+    first = iso.resolve_layout("a" * 64, _cfg(), hermes_home=tmp_path)
+    second = iso.resolve_layout("a" * 63 + "b", _cfg(), hermes_home=tmp_path)
+
+    assert len(first.daemon_name.encode("utf-8")) <= 38
+    assert len(second.daemon_name.encode("utf-8")) <= 38
+    assert first.daemon_name != second.daemon_name
 
 
 def test_session_identity_is_case_canonical_on_macos(tmp_path, monkeypatch):
@@ -214,6 +225,102 @@ def test_session_lock_serializes_threads(tmp_path):
     two.join(2)
     assert not one.is_alive() and not two.is_alive()
     assert second_acquired.is_set()
+
+
+def test_activity_lease_nonblocking_probe_skips_busy_session(tmp_path):
+    layout = iso.resolve_layout("active", _cfg(), hermes_home=tmp_path / "hermes")
+    with iso.activity_lease(layout) as lease_fd:
+        assert isinstance(lease_fd, int)
+        with iso.activity_lease(layout, blocking=False) as competing_fd:
+            assert competing_fd is None
+
+
+def test_activity_lease_is_shared_by_canonical_profile_across_hermes_homes(tmp_path):
+    profile_root = tmp_path / "shared-profiles"
+    cfg = _cfg(profile_root=str(profile_root))
+    first_home = tmp_path / "home-a"
+    second_home = tmp_path / "home-b"
+    first = iso.resolve_layout("shared", cfg, hermes_home=first_home)
+    second = iso.resolve_layout("shared", cfg, hermes_home=second_home)
+    second.state_dir.mkdir(parents=True)
+    iso.write_state(second, {"pid": 1, "last_used_at": 0.0})
+    callbacks = []
+
+    assert first.profile_dir == second.profile_dir
+    assert first.activity_lock_file == second.activity_lock_file
+    with iso.activity_lease(first):
+        assert iso.cleanup_idle_session(
+            "shared",
+            browser_cfg=cfg,
+            hermes_home=second_home,
+            idle_timeout=1800,
+            now=5000.0,
+            before_chrome_stop=lambda candidate: callbacks.append(candidate) or True,
+        ) is False
+    assert callbacks == []
+
+
+def test_idle_cleanup_stops_only_after_timeout(tmp_path, monkeypatch):
+    cfg = _cfg(idle_timeout=1800)
+    home = tmp_path / "hermes"
+    layout = iso.resolve_layout("idle", cfg, hermes_home=home)
+    layout.state_dir.mkdir(parents=True)
+    iso.write_state(
+        layout,
+        {
+            "pid": 4321,
+            "executable": "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+            "profile_dir": str(layout.profile_dir),
+            "last_used_at": 100.0,
+        },
+    )
+    events = []
+    commands = iter(("chrome", None))
+    monkeypatch.setattr(iso, "_pid_owns_profile", lambda *args: True)
+    monkeypatch.setattr(iso, "_process_command", lambda pid: next(commands))
+    monkeypatch.setattr(iso.os, "kill", lambda pid, sig: events.append(("chrome", pid)))
+
+    assert iso.cleanup_idle_session(
+        "idle",
+        browser_cfg=cfg,
+        hermes_home=home,
+        idle_timeout=1800,
+        now=1000.0,
+        before_chrome_stop=lambda candidate: events.append(("daemon", candidate.daemon_name)) or True,
+    ) is False
+    assert events == []
+
+    assert iso.cleanup_idle_session(
+        "idle",
+        browser_cfg=cfg,
+        hermes_home=home,
+        idle_timeout=1800,
+        now=2000.1,
+        before_chrome_stop=lambda candidate: events.append(("daemon", candidate.daemon_name)) or True,
+    ) is True
+    assert events[0][0] == "daemon"
+    assert events[1] == ("chrome", 4321)
+    assert not layout.state_file.exists()
+
+
+def test_idle_cleanup_never_stops_session_with_active_lease(tmp_path):
+    cfg = _cfg(idle_timeout=1800)
+    home = tmp_path / "hermes"
+    layout = iso.resolve_layout("busy", cfg, hermes_home=home)
+    layout.state_dir.mkdir(parents=True)
+    iso.write_state(layout, {"pid": 1, "last_used_at": 0.0})
+    callbacks = []
+
+    with iso.activity_lease(layout):
+        assert iso.cleanup_idle_session(
+            "busy",
+            browser_cfg=cfg,
+            hermes_home=home,
+            idle_timeout=1800,
+            now=5000.0,
+            before_chrome_stop=lambda candidate: callbacks.append(candidate) or True,
+        ) is False
+    assert callbacks == []
 
 
 def test_session_lock_rejects_symlink_without_touching_target(tmp_path):

@@ -6,17 +6,28 @@ instead of default browser tools
 
 import json
 import logging
+import math
 import os
 import re
 import shutil
+import socket
 import subprocess
+import threading
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+import psutil
+
 from tools.isolated_chrome_sessions import (
+    DEFAULT_IDLE_TIMEOUT,
+    activity_lease as _isolated_activity_lease,
+    cleanup_idle_session as _cleanup_idle_isolated_session,
     ensure_session as _ensure_isolated_chrome_session,
+    existing_session_names as _existing_isolated_sessions,
     is_enabled as _isolated_local_chrome_enabled,
+    resolve_layout as _resolve_isolated_layout,
+    touch_session_activity as _touch_isolated_activity,
 )
 from utils import is_truthy_value
 
@@ -136,6 +147,250 @@ def _read_browser_cfg() -> dict:
     except Exception as e:
         logger.debug("Could not read browser config section: %s", e)
         return {}
+
+
+def _read_browser_cfg_for_home(hermes_home: Path) -> dict:
+    """Read the effective config for one captured profile home."""
+    from hermes_cli.config import load_config_readonly
+    from hermes_constants import (
+        reset_hermes_home_override,
+        set_hermes_home_override,
+    )
+
+    token = set_hermes_home_override(hermes_home)
+    try:
+        config = load_config_readonly()
+        browser = config.get("browser") or {}
+        return browser if isinstance(browser, dict) else {}
+    except Exception as exc:
+        logger.warning("Could not refresh browser config for %s: %s", hermes_home, exc)
+        return {}
+    finally:
+        reset_hermes_home_override(token)
+
+
+_ISOLATED_CLEANUP_INTERVAL_S = 60.0
+_isolated_cleanup_workers: dict[str, tuple[threading.Thread, threading.Event]] = {}
+_isolated_cleanup_workers_lock = threading.Lock()
+
+
+def _isolated_idle_timeout(browser_cfg: dict) -> float:
+    local = browser_cfg.get("local_chrome") or {}
+    try:
+        value = float(local.get("idle_timeout", DEFAULT_IDLE_TIMEOUT))
+    except (TypeError, ValueError):
+        return DEFAULT_IDLE_TIMEOUT
+    if not math.isfinite(value) or value < 0:
+        return DEFAULT_IDLE_TIMEOUT
+    if value == 0:
+        return 0.0
+    return value
+
+
+def _browser_harness_runtime_artifacts(
+    layout, env: dict[str, str]
+) -> tuple[Path, Path]:
+    """Return Browser Harness's exact PID and IPC paths for this environment."""
+    isolated_runtime = env.get("BH_RUNTIME_DIR") or env.get("BH_TMP_DIR")
+    if isolated_runtime:
+        runtime = Path(isolated_runtime).expanduser().resolve()
+        shared = env.get("BH_RUNTIME_DIR_SHARED") == "1"
+        stem = f"bu-{layout.daemon_name}" if shared else "bu"
+    else:
+        home = env.get("BH_HOME") or env.get("BROWSER_HARNESS_HOME")
+        if home:
+            runtime = Path(home).expanduser().resolve() / "runtime"
+        elif env.get("XDG_CONFIG_HOME"):
+            runtime = (
+                Path(env["XDG_CONFIG_HOME"]).expanduser().resolve()
+                / "browser-harness"
+                / "runtime"
+            )
+        else:
+            user_home = Path(
+                env.get("HOME") or str(Path.home())
+            ).expanduser().resolve()
+            runtime = user_home / ".config" / "browser-harness" / "runtime"
+        stem = f"bu-{layout.daemon_name}"
+    endpoint = runtime / f"{stem}.{'port' if os.name == 'nt' else 'sock'}"
+    return runtime / f"{stem}.pid", endpoint
+
+
+def _identify_harness_daemon(
+    layout, env: dict[str, str]
+) -> Optional[tuple[int, float]]:
+    """Identify a live daemon end-to-end through its private IPC endpoint."""
+    _, endpoint = _browser_harness_runtime_artifacts(layout, env)
+    client = None
+    try:
+        token = None
+        if os.name == "nt":  # pragma: no cover - exercised on Windows CI
+            endpoint_data = json.loads(endpoint.read_text(encoding="utf-8"))
+            port = int(endpoint_data["port"])
+            token = str(endpoint_data["token"])
+            client = socket.create_connection(("127.0.0.1", port), timeout=1.0)
+        else:
+            client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            client.settimeout(1.0)
+            client.connect(str(endpoint))
+        request = {"meta": "ping"}
+        if token:
+            request["token"] = token
+        client.sendall((json.dumps(request) + "\n").encode("utf-8"))
+        payload = b""
+        while not payload.endswith(b"\n"):
+            chunk = client.recv(1 << 16)
+            if not chunk:
+                break
+            payload += chunk
+        response = json.loads(payload or b"{}")
+        if not isinstance(response, dict) or response.get("pong") is not True:
+            return None
+        pid = response.get("pid")
+        if type(pid) is not int or not 0 < pid < (1 << 31):
+            return None
+        return pid, psutil.Process(pid).create_time()
+    except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError, psutil.Error):
+        return None
+    finally:
+        if client is not None:
+            try:
+                client.close()
+            except OSError:
+                pass
+
+
+def _pid_file_identity(pid_file: Path) -> Optional[tuple[int, float]]:
+    try:
+        pid = int(pid_file.read_text(encoding="utf-8").strip())
+        if not 0 < pid < (1 << 31):
+            return None
+        return pid, psutil.Process(pid).create_time()
+    except (OSError, ValueError, psutil.Error):
+        return None
+
+
+def _process_identity_alive(identity: tuple[int, float]) -> bool:
+    pid, started = identity
+    try:
+        process = psutil.Process(pid)
+        return (
+            process.create_time() == started
+            and process.status() != psutil.STATUS_ZOMBIE
+        )
+    except psutil.NoSuchProcess:
+        return False
+    except psutil.Error:
+        return True
+
+
+def _stop_isolated_harness_daemon(layout, cli: list[str], env: dict[str, str]) -> bool:
+    """Stop one exact named harness daemon and verify it is absent."""
+    stop_env = dict(env)
+    stop_env["BU_NAME"] = layout.daemon_name
+    pid_file, _ = _browser_harness_runtime_artifacts(layout, stop_env)
+    identity = _identify_harness_daemon(layout, stop_env) or _pid_file_identity(
+        pid_file
+    )
+
+    try:
+        result = subprocess.run(
+            [*cli, "--reload"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            env=stop_env,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        logger.warning("Could not stop isolated browser daemon %s: %s", layout.daemon_name, exc)
+        return False
+    if result.returncode != 0:
+        logger.warning(
+            "Browser daemon %s refused shutdown: %s",
+            layout.daemon_name,
+            (result.stderr or result.stdout or "unknown error").strip()[-500:],
+        )
+        return False
+
+    # Without a PID/create-time identity, artifact cleanup cannot prove that an
+    # older daemon process actually exited. Fail closed and leave Chrome alive.
+    if identity is None:
+        logger.warning(
+            "Browser daemon %s had no verifiable process identity; refusing Chrome shutdown",
+            layout.daemon_name,
+        )
+        return False
+
+    deadline = time.monotonic() + 10.0
+    while time.monotonic() < deadline and _process_identity_alive(identity):
+        time.sleep(0.1)
+    if _process_identity_alive(identity):
+        logger.warning(
+            "Browser daemon %s is still running after shutdown",
+            layout.daemon_name,
+        )
+        return False
+    # Fail closed if --reload replaced the daemon instead of stopping it.
+    return _identify_harness_daemon(layout, stop_env) is None
+
+
+def _cleanup_isolated_sessions(browser_cfg: dict, hermes_home: Path) -> int:
+    idle_timeout = _isolated_idle_timeout(browser_cfg)
+    if idle_timeout <= 0:
+        return 0
+    cli = _find_cli()
+    if not cli:
+        return 0
+    env = _base_subprocess_env()
+    cleaned = 0
+    for name in _existing_isolated_sessions(hermes_home=hermes_home):
+        try:
+            if _cleanup_idle_isolated_session(
+                name,
+                browser_cfg=browser_cfg,
+                hermes_home=hermes_home,
+                idle_timeout=idle_timeout,
+                before_chrome_stop=lambda layout: _stop_isolated_harness_daemon(
+                    layout, cli, env
+                ),
+            ):
+                cleaned += 1
+        except Exception as exc:
+            logger.warning("Idle cleanup skipped isolated Chrome session %s: %s", name, exc)
+    return cleaned
+
+
+def _cleanup_isolated_sessions_from_current_config(hermes_home: Path) -> int:
+    browser_cfg = _read_browser_cfg_for_home(hermes_home)
+    if (
+        not _isolated_local_chrome_enabled(browser_cfg)
+        or _isolated_idle_timeout(browser_cfg) <= 0
+    ):
+        return 0
+    return _cleanup_isolated_sessions(browser_cfg, hermes_home)
+
+
+def _start_isolated_cleanup_worker(hermes_home: Path) -> None:
+    key = str(hermes_home.expanduser().resolve())
+    with _isolated_cleanup_workers_lock:
+        current = _isolated_cleanup_workers.get(key)
+        if current and current[0].is_alive():
+            return
+        stop_event = threading.Event()
+
+        def worker() -> None:
+            while not stop_event.wait(_ISOLATED_CLEANUP_INTERVAL_S):
+                cleaned = _cleanup_isolated_sessions_from_current_config(Path(key))
+                if cleaned:
+                    logger.info("Closed %s idle isolated Chrome session(s)", cleaned)
+
+        thread = threading.Thread(
+            target=worker,
+            daemon=True,
+            name=f"isolated-chrome-cleanup-{hash(key) & 0xFFFF:x}",
+        )
+        _isolated_cleanup_workers[key] = (thread, stop_event)
+        thread.start()
 
 
 def get_browser_backend() -> str:
@@ -572,6 +827,8 @@ def browser_exec(
     session: str = "",
     timeout_s: int = _DEFAULT_TIMEOUT_S,
     task_id: Optional[str] = None,
+    _isolated_wrapped: bool = False,
+    _activity_fd: Optional[int] = None,
 ):
     """Run Python code through the browser-use CLI, and return its output"""
     from tools.registry import tool_error, tool_result
@@ -600,6 +857,28 @@ def browser_exec(
                 "dashes, or underscores (e.g. 'r7k2')."
             )
         env["BU_NAME"] = session
+
+    browser_cfg = _read_browser_cfg()
+    if not _isolated_wrapped and _isolated_local_chrome_enabled(browser_cfg):
+        from hermes_constants import get_hermes_home
+
+        hermes_home = Path(get_hermes_home()).expanduser().resolve()
+        layout = _resolve_isolated_layout(
+            session, browser_cfg, hermes_home=hermes_home
+        )
+        _start_isolated_cleanup_worker(hermes_home)
+        with _isolated_activity_lease(layout) as lease_fd:
+            try:
+                return browser_exec(
+                    code,
+                    session=session,
+                    timeout_s=timeout_s,
+                    task_id=task_id,
+                    _isolated_wrapped=True,
+                    _activity_fd=lease_fd,
+                )
+            finally:
+                _touch_isolated_activity(layout)
     # Route through the configured browser backend (Browserbase, Firecrawl,
     # Nous gateway, CDP override, local Chrome, …). Named sessions compose
     # with the backend: BU_NAME namespaces the harness daemon (its IPC
@@ -637,6 +916,8 @@ def browser_exec(
 
     # Windows: hide the console the .cmd shim would flash (as browser_tool does)
     popen_extra: dict = {}
+    if os.name == "posix" and _activity_fd is not None:
+        popen_extra["pass_fds"] = (_activity_fd,)
     if os.name == "nt":
         try:
             from hermes_cli._subprocess_compat import windows_hide_flags
