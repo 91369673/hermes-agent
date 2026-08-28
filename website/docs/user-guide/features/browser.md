@@ -95,6 +95,9 @@ browser:
     # Optional; auto-detected on macOS/Linux/Windows
     executable_path: ""
     startup_timeout: 20
+    # Close the daemon and Chrome after 30 minutes without browser_exec use.
+    # The profile, cookies, and login state remain on disk. Set 0 to disable.
+    idle_timeout: 1800
 ```
 
 Hermes then launches the installed Google Chrome/Chromium executable with a
@@ -112,6 +115,9 @@ profile. It never reads or attaches to the normal Chrome data directory.
   synthetic HOME, so macOS Keychain-backed browser/login helpers keep working.
 - Profiles remain on disk across Chrome, Hermes, and machine restarts. CDP is
   exposed only while the isolated Chrome process is running and only on loopback.
+- After `idle_timeout` seconds without a `browser_exec` call, Hermes closes the
+  Browser Harness daemon and Chrome process. Reusing the session name starts
+  Chrome again with the same persistent profile and login state.
 
 Use stable, purpose-specific names such as `seller-us`, `seller-jp`, or
 `finance`; do not generate a fresh name per call if you want login persistence.

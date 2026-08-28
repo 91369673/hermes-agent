@@ -23,7 +23,7 @@ import stat
 import subprocess
 import sys
 import time
-from typing import Any, Iterator, Mapping, Optional
+from typing import Any, Callable, Iterator, Mapping, Optional
 from urllib.request import Request, urlopen
 
 import psutil
@@ -34,6 +34,7 @@ from hermes_constants import get_hermes_home
 _SESSION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
 _DEFAULT_SESSION = "default"
 _DEFAULT_STARTUP_TIMEOUT = 20.0
+DEFAULT_IDLE_TIMEOUT = 1800.0
 
 
 @dataclass(frozen=True)
@@ -45,6 +46,7 @@ class SessionLayout:
     state_file: Path
     log_file: Path
     lock_file: Path
+    activity_lock_file: Path
 
 
 @dataclass(frozen=True)
@@ -174,17 +176,21 @@ def resolve_layout(
     except ValueError as exc:
         raise ValueError("isolated Chrome session escapes its state root") from exc
     namespace = hashlib.sha256(str(home).encode("utf-8")).hexdigest()[:10]
-    suffix_budget = 64 - len("hiso--") - len(namespace)
+    # macOS AF_UNIX paths allow 103 pathname bytes. Browser Harness's default
+    # runtime prefix leaves 38 bytes for BU_NAME on this installation. Keeping
+    # the name at that conservative size also prevents long custom homes from
+    # launching Chrome only to have the harness fail afterwards.
+    daemon_budget = 38 if sys.platform == "darwin" else 64
+    suffix_budget = daemon_budget - len("hiso--") - len(namespace)
     if len(name) <= suffix_budget:
         daemon_suffix = name
     else:
-        # Browser Harness caps BU_NAME at 64 chars. Keep a readable prefix but
-        # bind the truncated suffix to the complete session identity so two
-        # names that differ only near their end never share one daemon.
+        # Bind the shortened suffix to the complete session identity so names
+        # that differ only near their end never share one daemon.
         digest = base64.urlsafe_b64encode(
             hashlib.sha256(name.encode("utf-8")).digest()
         ).decode("ascii").rstrip("=")
-        daemon_suffix = f"{name[: suffix_budget - len(digest) - 1]}-{digest}"
+        daemon_suffix = digest[:suffix_budget]
     daemon_name = f"hiso-{namespace}-{daemon_suffix}"
     return SessionLayout(
         session_name=name,
@@ -194,6 +200,10 @@ def resolve_layout(
         state_file=state_dir / "state.json",
         log_file=state_dir / "chrome.log",
         lock_file=state_dir / "session.lock",
+        # The activity lease follows the canonical Chrome profile rather than
+        # HERMES_HOME, so two profiles cannot independently control the same
+        # user-data-dir while one of them is active.
+        activity_lock_file=profile_dir / ".hermes-activity.lock",
     )
 
 
@@ -361,6 +371,72 @@ def _session_lock(layout: SessionLayout) -> Iterator[None]:
             return
 
         raise RuntimeError(f"isolated Chrome session locks are unsupported on {os.name}")
+
+
+@contextmanager
+def activity_lease(
+    layout: SessionLayout,
+    *,
+    blocking: bool = True,
+) -> Iterator[Optional[int]]:
+    """Protect one browser_exec call from idle cleanup.
+
+    The yielded descriptor is passed to the Browser Use subprocess on POSIX,
+    so the advisory lock survives a controller exit until the CLI itself ends.
+    A non-blocking cleanup probe yields ``None`` when the session is active.
+    """
+    _ensure_private_directory(layout.state_dir)
+    _ensure_private_directory(layout.activity_lock_file.parent)
+    lock_fd = _open_regular_nofollow(
+        layout.activity_lock_file, os.O_RDWR | os.O_CREAT
+    )
+    _set_open_file_mode(lock_fd, layout.activity_lock_file)
+    with os.fdopen(lock_fd, "a+b", closefd=True) as handle:
+        if os.name == "posix":
+            import fcntl
+
+            flags = fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB)
+            try:
+                fcntl.flock(handle.fileno(), flags)
+            except BlockingIOError:
+                yield None
+                return
+            try:
+                yield handle.fileno()
+            finally:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            return
+
+        if os.name == "nt":  # pragma: no cover - exercised on Windows CI
+            import msvcrt
+
+            handle.seek(0, os.SEEK_END)
+            if handle.tell() == 0:
+                handle.write(b"0")
+                handle.flush()
+            deadline = time.monotonic() + 15.0
+            while True:
+                try:
+                    handle.seek(0)
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                    break
+                except OSError:
+                    if not blocking:
+                        yield None
+                        return
+                    if time.monotonic() >= deadline:
+                        raise RuntimeError(
+                            "timed out waiting for isolated Chrome activity lease"
+                        ) from None
+                    time.sleep(0.05)
+            try:
+                yield handle.fileno()
+            finally:
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+            return
+
+        raise RuntimeError(f"isolated Chrome activity locks are unsupported on {os.name}")
 
 
 def _find_chrome_executable(local_cfg: Mapping[str, Any]) -> Path:
@@ -610,6 +686,119 @@ def ensure_session(
         )
 
 
+def touch_session_activity(layout: SessionLayout, *, now: Optional[float] = None) -> bool:
+    """Refresh last_used_at without recreating a stopped session."""
+    with _session_lock(layout):
+        state = _read_state(layout)
+        if not state:
+            return False
+        write_state(layout, {**state, "last_used_at": time.time() if now is None else now})
+        return True
+
+
+def existing_session_names(*, hermes_home: Optional[Path] = None) -> list[str]:
+    home = Path(hermes_home or get_hermes_home()).expanduser().resolve()
+    state_root = home / "browser_sessions" / "chrome"
+    if not state_root.is_dir():
+        return []
+    return sorted(
+        entry.name
+        for entry in state_root.iterdir()
+        if entry.is_dir() and _SESSION_RE.fullmatch(entry.name)
+    )
+
+
+def _stop_session_locked(
+    layout: SessionLayout,
+    state: Mapping[str, Any],
+    *,
+    timeout: float,
+    allow_stale_state: bool = False,
+) -> bool:
+    try:
+        pid = int(str(state.get("pid")))
+    except (TypeError, ValueError):
+        raise RuntimeError("isolated Chrome state has no valid pid") from None
+    executable = Path(str(state.get("executable") or "")).expanduser()
+    if not _pid_owns_profile(pid, executable, layout.profile_dir):
+        # A dead Chrome can leave state behind. Removing that stale controller
+        # record is safe after the harness daemon was stopped by the caller.
+        if allow_stale_state and _process_command(pid) is None:
+            try:
+                layout.state_file.unlink()
+            except FileNotFoundError:
+                pass
+            return True
+        raise RuntimeError(
+            "isolated Chrome process ownership could not be proven; refusing to stop it"
+        )
+    os.kill(pid, signal.SIGTERM)
+    deadline = time.monotonic() + max(0.5, timeout)
+    while time.monotonic() < deadline:
+        if _process_command(pid) is None:
+            break
+        time.sleep(0.1)
+    else:
+        raise RuntimeError(f"isolated Chrome process {pid} did not exit after SIGTERM")
+    try:
+        layout.state_file.unlink()
+    except FileNotFoundError:
+        pass
+    try:
+        (layout.profile_dir / "DevToolsActivePort").unlink()
+    except FileNotFoundError:
+        pass
+    return True
+
+
+def cleanup_idle_session(
+    session_name: str,
+    *,
+    browser_cfg: Optional[Mapping[str, Any]] = None,
+    hermes_home: Optional[Path] = None,
+    idle_timeout: float = DEFAULT_IDLE_TIMEOUT,
+    now: Optional[float] = None,
+    before_chrome_stop: Optional[Callable[[SessionLayout], bool]] = None,
+    stop_timeout: float = 10.0,
+) -> bool:
+    """Stop one session only when idle and not leased by browser_exec."""
+    if idle_timeout <= 0:
+        return False
+    layout = resolve_layout(session_name, browser_cfg, hermes_home=hermes_home)
+    with activity_lease(layout, blocking=False) as lease_fd:
+        if lease_fd is None:
+            return False
+        with _session_lock(layout):
+            state = _read_state(layout)
+            if not state:
+                return False
+            try:
+                last_used = float(str(state.get("last_used_at")))
+            except (TypeError, ValueError):
+                return False
+            current = time.time() if now is None else now
+            if current - last_used < idle_timeout:
+                return False
+            try:
+                pid = int(str(state.get("pid")))
+            except (TypeError, ValueError):
+                return False
+            executable = Path(str(state.get("executable") or "")).expanduser()
+            if (
+                _process_command(pid) is not None
+                and not _pid_owns_profile(pid, executable, layout.profile_dir)
+            ):
+                return False
+            if before_chrome_stop is not None and not before_chrome_stop(layout):
+                return False
+            return _stop_session_locked(
+                layout,
+                state,
+                timeout=stop_timeout,
+                allow_stale_state=True,
+            )
+
+
 def stop_session(
     session_name: str = "",
     *,
@@ -618,31 +807,9 @@ def stop_session(
     timeout: float = 10.0,
 ) -> bool:
     layout = resolve_layout(session_name, browser_cfg, hermes_home=hermes_home)
-    with _session_lock(layout):
-        state = _read_state(layout)
-        if not state:
-            return False
-        try:
-            pid = int(str(state.get("pid")))
-        except (TypeError, ValueError):
-            raise RuntimeError("isolated Chrome state has no valid pid") from None
-        executable = Path(str(state.get("executable") or "")).expanduser()
-        if not _pid_owns_profile(pid, executable, layout.profile_dir):
-            raise RuntimeError("isolated Chrome process ownership could not be proven; refusing to stop it")
-        os.kill(pid, signal.SIGTERM)
-        deadline = time.monotonic() + max(0.5, timeout)
-        while time.monotonic() < deadline:
-            if _process_command(pid) is None:
-                break
-            time.sleep(0.1)
-        else:
-            raise RuntimeError(f"isolated Chrome process {pid} did not exit after SIGTERM")
-        try:
-            layout.state_file.unlink()
-        except FileNotFoundError:
-            pass
-        try:
-            (layout.profile_dir / "DevToolsActivePort").unlink()
-        except FileNotFoundError:
-            pass
-        return True
+    with activity_lease(layout):
+        with _session_lock(layout):
+            state = _read_state(layout)
+            if not state:
+                return False
+            return _stop_session_locked(layout, state, timeout=timeout)
