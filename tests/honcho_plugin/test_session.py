@@ -523,6 +523,29 @@ class TestDialecticInjectionCap:
         assert result == answer
         assert not result.endswith(" …")
 
+    def test_service_unavailable_is_quiet_for_auto_and_clear_for_explicit(self):
+        class ServiceUnavailable(RuntimeError):
+            status_code = 503
+
+        mgr = self._manager_with_long_answer("")
+        mock_peer = MagicMock()
+        mock_peer.chat.side_effect = ServiceUnavailable("temporary backend outage")
+        mgr._get_or_create_peer = MagicMock(return_value=mock_peer)
+
+        assert mgr.dialectic_query("test", "auto") == ""
+        explicit = mgr.dialectic_query("test", "explicit", raise_errors=True)
+        assert "temporarily deferred" in explicit
+        assert "profile, context, and search remain available" in explicit
+
+        # Some Honcho SDK versions keep the controlled detail but hide status_code.
+        text_only_peer = MagicMock()
+        text_only_peer.chat.side_effect = RuntimeError(
+            "Honcho reasoning is deferred because local Qwen on the M4 is unavailable"
+        )
+        mgr._get_or_create_peer = MagicMock(return_value=text_only_peer)
+        text_only = mgr.dialectic_query("test", "explicit", raise_errors=True)
+        assert "temporarily deferred" in text_only
+
 
 # ---------------------------------------------------------------------------
 

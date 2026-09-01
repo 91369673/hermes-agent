@@ -33,6 +33,24 @@ class HonchoAuthError(RuntimeError):
     """
 
 
+_HONCHO_GENERATIVE_DEFERRED_MESSAGE = (
+    "Honcho reasoning is temporarily deferred because local Qwen on the M4 "
+    "is unavailable. Stored profile, context, and search remain available."
+)
+
+
+def _is_service_unavailable(exc: BaseException) -> bool:
+    status = getattr(exc, "status_code", None) or getattr(exc, "status", None)
+    if status == 503:
+        return True
+    response = getattr(exc, "response", None)
+    if getattr(response, "status_code", None) == 503:
+        return True
+    # Honcho SDK versions do not all expose the HTTP status as an attribute.
+    # Match only our exact controlled backend detail, never generic failures.
+    return "local qwen on the m4 is unavailable" in str(exc).lower()
+
+
 # Matched narrowly: a false positive spends a token rotation, and a lost rotation revokes the grant.
 _AUTH_ERROR_MARKERS = (
     "invalid or expired access token",
@@ -947,6 +965,9 @@ class HonchoSessionManager:
         except HonchoAuthError:
             raise
         except Exception as e:
+            if _is_service_unavailable(e):
+                logger.info("Honcho dialectic deferred: local Qwen unavailable")
+                return _HONCHO_GENERATIVE_DEFERRED_MESSAGE if raise_errors else ""
             logger.warning("Honcho dialectic query failed: %s", e)
             if raise_errors:
                 raise
